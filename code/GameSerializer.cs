@@ -1,4 +1,14 @@
-﻿using System;
+﻿
+// https://github.com/plyoung/Simple-Serialiser
+//
+// version 1.0.0
+//	- initial release
+//
+// version 1.0.1
+//	- improved enum, array and list handling to use less space
+//
+
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
@@ -15,6 +25,7 @@ namespace BMGame
 
         private readonly Dictionary<Type, Func<object, byte[]>> writers = new Dictionary<Type, Func<object, byte[]>>();
         private readonly Dictionary<Type, Func<byte[], object>> readers = new Dictionary<Type, Func<byte[], object>>();
+		private readonly Dictionary<Type, byte> lengths = new Dictionary<Type, byte>();
 
 		public GameSerializer()
 		{
@@ -61,6 +72,44 @@ namespace BMGame
 			readers[typeof(Rect)] = data => ToRect(data);
 			readers[typeof(Color)] = data => ToColor(data);
 			readers[typeof(Color32)] = data => ToColor32(data);
+
+			lengths[typeof(bool)] = 1;
+			lengths[typeof(byte)] = 1;
+			lengths[typeof(sbyte)] = 1;
+			lengths[typeof(char)] = 1;
+			lengths[typeof(int)] = 4;
+			lengths[typeof(uint)] = 4;
+			lengths[typeof(short)] = 2;
+			lengths[typeof(ushort)] = 2;
+			lengths[typeof(long)] = 8;
+			lengths[typeof(ulong)] = 8;
+			lengths[typeof(float)] = 4;
+			lengths[typeof(double)] = 8;
+			lengths[typeof(decimal)] = 16;
+			lengths[typeof(Vector2)] = 8;
+			lengths[typeof(Vector3)] = 12;
+			lengths[typeof(Vector4)] = 16;
+			lengths[typeof(Quaternion)] = 16;
+			lengths[typeof(Rect)] = 16;
+			lengths[typeof(Color)] = 16;
+			lengths[typeof(Color32)] = 4;
+		}
+
+		private Func<object, byte[]> GetSerializer(Type t)
+		{
+			if (t.IsArray) return SerializeArray;
+			if (t.IsGenericType && t.GetGenericTypeDefinition() == typeof(List<>)) return SerializeList;
+			if (t.IsEnum) return SerializeEnum;
+			Func<object, byte[]> f = null;
+			if (writers.TryGetValue(t, out f)) return f;
+			return null;
+		}
+
+		private byte ByteLength(Type t)
+		{
+			byte l;
+			if (lengths.TryGetValue(t, out l)) return l;
+			return 0;
 		}
 
 		// ------------------------------------------------------------------------------------------------------------
@@ -68,14 +117,21 @@ namespace BMGame
 		public byte[] Serialize(object obj)
 		{
 			if (obj == null) return new byte[0];
-			Type t = obj.GetType();
+			Func<object, byte[]> f = GetSerializer(obj.GetType());
+			if (f != null) return f(obj);
 
-			if (t.IsArray) return SerializeArray(obj);
-			if (t.IsGenericType && t.GetGenericTypeDefinition() == typeof(List<>)) return SerializeList(obj);
-			if (t.IsEnum) return GetBytes((int)obj);
-			if (writers.ContainsKey(t)) return writers[t](obj);
+			throw new Exception("[GameSerializer] Unsupported Type: " + obj.GetType());
+		}
 
-			throw new IndexOutOfRangeException("[GameSerializer] Unsupported Type: " + t);
+		public object Deserialize(byte[] data, Type t)
+		{
+			if (data == null || data.Length == 0) return null;
+
+			if (t.IsArray) return DeserializeArray(data, t);
+			if (t.IsEnum) return DeserializeEnum(data, t);
+			if (readers.ContainsKey(t)) return readers[t](data);
+
+			throw new Exception("[GameSerializer] Unsupported Type: " + t);
 		}
 
 		public T Deserialize<T>(byte[] data)
@@ -84,44 +140,40 @@ namespace BMGame
 
 			Type t = typeof(T);
 			if (t.IsArray) return (T)DeserializeArray(data, t);
-			if (t.IsEnum) return (T)Enum.ToObject(t, ToInt(data));
+			if (t.IsEnum) return (T)DeserializeEnum(data, t);
 			if (readers.ContainsKey(t)) return (T)readers[t](data);
 
-			throw new IndexOutOfRangeException("[GameSerializer] Unsupported Type: " + t);
+			throw new Exception("[GameSerializer] Unsupported Type: " + t);
 		}
 
-		public object Deserialize(byte[] data, Type t)
-		{
-			if (data == null || data.Length == 0) return null;
-
-			if (t.IsArray) return DeserializeArray(data, t);
-			if (t.IsEnum) return Enum.ToObject(t, ToInt(data));
-			if (readers.ContainsKey(t)) return readers[t](data);
-
-			throw new IndexOutOfRangeException("[GameSerializer] Unsupported Type: " + t);
-		}
+		// ------------------------------------------------------------------------------------------------------------
 
 		public byte[] SerializeArray(object obj)
 		{
 			Array arr = obj as Array;
 			if (arr == null) return new byte[0];
 
-			byte[] returnData;
+			Type t = obj.GetType().GetElementType();
+			Func<object, byte[]> f = GetSerializer(t);
+			if (f == null) throw new Exception("[GameSerializer] Unsupported Array type.");
+
+			byte entryByteLength = ByteLength(t);
 			MemoryStream stream = new MemoryStream();
 			using (BinaryWriter writer = new BinaryWriter(stream))
 			{
 				writer.Write((Int32)arr.Length);
+				writer.Write((Byte)entryByteLength);
 				for (int i = 0; i < arr.Length; i++)
 				{
 					object value = arr.GetValue(i);
 					byte[] bytes = Serialize(value);
-					writer.Write((Int32)bytes.Length);
+					if (entryByteLength == 0) writer.Write((UInt16)bytes.Length); // variable length - store size of entry
 					writer.Write(bytes);
 				}
 			}
 
 			stream.Flush();
-			returnData = stream.GetBuffer();
+			byte[] returnData = stream.ToArray();
 			stream.Close();
 
 			return returnData;
@@ -129,8 +181,10 @@ namespace BMGame
 
 		public object DeserializeArray(byte[] data, Type t)
 		{
-			t = t.GetElementType();
 			if (data == null || data.Length == 0) return Array.CreateInstance(t, 0);
+
+			Func<byte[], object> f = null;
+			readers.TryGetValue(t, out f);
 
 			Array arr = null;
 			using (MemoryStream stream = new MemoryStream(data, false))
@@ -138,14 +192,25 @@ namespace BMGame
 				using (BinaryReader reader = new BinaryReader(stream))
 				{
 					int count = reader.ReadInt32();
+					byte bytesLength = reader.ReadByte();
+					byte[] bytes = new byte[bytesLength];
 					arr = Array.CreateInstance(t, count);
 					for (int i = 0; i < count; i++)
 					{
-						int bytesLength = reader.ReadInt32();
-						byte[] bytes = new byte[bytesLength];
-						reader.Read(bytes, 0, bytesLength);
-						object obj = Deserialize(bytes, t);
-						arr.SetValue(obj, i);
+						if (bytesLength == 0)
+						{	 // variable length entries
+							int len = reader.ReadUInt16();
+							bytes = new byte[len];
+							reader.Read(bytes, 0, len);
+							object obj = (f == null ? Deserialize(bytes, t) : f(bytes));
+							arr.SetValue(obj, i);
+						}
+						else
+						{
+							reader.Read(bytes, 0, bytesLength);
+							object obj = (f == null ? Deserialize(bytes, t) : f(bytes));
+							arr.SetValue(obj, i);
+						}
 					}
 				}
 			}
@@ -157,45 +222,66 @@ namespace BMGame
 			T[] arr = null;
 			if (data == null || data.Length == 0) return arr;
 
+			Type t = typeof(T);
+			Func<byte[], object> f = null;
+			readers.TryGetValue(t, out f);
+
 			using (MemoryStream stream = new MemoryStream(data, false))
 			{
 				using (BinaryReader reader = new BinaryReader(stream))
 				{
 					int count = reader.ReadInt32();
+					byte bytesLength = reader.ReadByte();
+					byte[] bytes = new byte[bytesLength];
 					arr = new T[count];
 					for (int i = 0; i < count; i++)
 					{
-						int bytesLength = reader.ReadInt32();
-						byte[] bytes = new byte[bytesLength];
-						reader.Read(bytes, 0, bytesLength);
-						arr[i] = Deserialize<T>(bytes);
+						if (bytesLength == 0)
+						{	 // variable length entries
+							int len = reader.ReadUInt16();
+							bytes = new byte[len];
+							reader.Read(bytes, 0, len);
+							arr[i] = (T)(f == null ? Deserialize(bytes, t) : f(bytes));
+						}
+						else
+						{
+							reader.Read(bytes, 0, bytesLength);
+							arr[i] = (T)(f == null ? Deserialize(bytes, t) : f(bytes));
+						}
 					}
 				}
 			}
 			return arr;
 		}
 
+		// ------------------------------------------------------------------------------------------------------------
+
 		public byte[] SerializeList(object obj)
 		{
 			IList lst = obj as IList;
 			if (lst == null) return new byte[0];
 
-			byte[] returnData;
+			Type t = obj.GetType().GetGenericArguments()[0];
+			Func<object, byte[]> f = GetSerializer(t);
+			if (f == null) throw new Exception("[GameSerializer] Unsupported Array type.");
+
+			byte entryByteLength = ByteLength(t);
 			MemoryStream stream = new MemoryStream();
 			using (BinaryWriter writer = new BinaryWriter(stream))
 			{
 				writer.Write((Int32)lst.Count);
+				writer.Write((Byte)entryByteLength);
 				for (int i = 0; i < lst.Count; i++)
 				{
 					object value = lst[i];
-					byte[] bytes = Serialize(value);
-					writer.Write((Int32)bytes.Length);
+					byte[] bytes = f(value);
+					if (entryByteLength == 0) writer.Write((UInt16)bytes.Length); // variable length - store size of entry
 					writer.Write(bytes);
 				}
 			}
 
 			stream.Flush();
-			returnData = stream.GetBuffer();
+			byte[] returnData = stream.ToArray();
 			stream.Close();
 
 			return returnData;
@@ -206,22 +292,65 @@ namespace BMGame
 			List<T> lst = new List<T>();
 			if (data == null || data.Length == 0) return lst;
 
+			Type t = typeof(T);
+			Func<byte[], object> f = null;
+			readers.TryGetValue(t, out f);
+
 			using (MemoryStream stream = new MemoryStream(data, false))
 			{
 				using (BinaryReader reader = new BinaryReader(stream))
 				{
 					int count = reader.ReadInt32();
+					byte bytesLength = reader.ReadByte();
+					byte[] bytes = new byte[bytesLength];
 					for (int i = 0; i < count; i++)
 					{
-						int bytesLength = reader.ReadInt32();
-						byte[] bytes = new byte[bytesLength];
-						reader.Read(bytes, 0, bytesLength);
-						T obj = Deserialize<T>(bytes);
-						lst.Add(obj);
+						if (bytesLength == 0)
+						{
+							int len = reader.ReadUInt16();
+							bytes = new byte[len];
+							reader.Read(bytes, 0, len);
+							T obj = (T)(f == null ? Deserialize(bytes, t) : f(bytes));
+							lst.Add(obj);
+						}
+						else
+						{
+							reader.Read(bytes, 0, bytesLength);
+							T obj = (T)(f == null ? Deserialize(bytes, t) : f(bytes));
+							lst.Add(obj);
+						}
 					}
 				}
 			}
 			return lst;
+		}
+
+		// ------------------------------------------------------------------------------------------------------------
+
+		public byte[] SerializeEnum(object obj)
+		{
+			Type t = Enum.GetUnderlyingType(obj.GetType());
+			Func<object, byte[]> f = null;
+			if (writers.TryGetValue(t, out f)) return f(obj);
+			return new byte[0];
+		}
+
+		public object DeserializeEnum(byte[] data, Type t)
+		{
+			Type tt = Enum.GetUnderlyingType(t);
+			Func<byte[], object> f = null;
+			if (readers.TryGetValue(tt, out f))
+			{
+				object val = f(data);
+				return Enum.ToObject(t, val);
+			}
+
+			throw new Exception("[GameSerializer] Could not Deserialize Enum.");
+		}
+
+		public T DeserializeEnum<T>(byte[] data)
+		{
+			return (T)DeserializeEnum(data, typeof(T));
 		}
 
 		// ------------------------------------------------------------------------------------------------------------
