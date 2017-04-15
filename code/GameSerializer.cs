@@ -6,6 +6,7 @@
 //
 // version 1.0.1
 //	- improved enum, array and list handling to use less space
+//	- there was a bug in the array and list serialisers causing them to generate too big arrays
 //
 
 using System;
